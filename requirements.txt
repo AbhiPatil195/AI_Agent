@@ -1,0 +1,9 @@
+pandas>=1.5,<3
+matplotlib>=3.5,<4
+python-docx>=0.8.11,<1
+reportlab>=3.6,<4
+Pillow>=9,<11
+# Optional (skip if not needed):
+faster-whisper>=0.10
+pydantic>=2,<3
+streamlit>=1.38

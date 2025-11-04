@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+
+# Envs
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Outputs
+src/output/
+src/memory/
+reports/
+*.log
+
