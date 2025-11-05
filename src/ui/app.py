@@ -4,6 +4,10 @@ from pathlib import Path
 from datetime import datetime
 import re
 from typing import Optional
+import subprocess
+import io
+import zipfile
+import json
 import sys
 
 import streamlit as st
@@ -32,14 +36,22 @@ st.set_page_config(page_title="Agent Suite", layout="wide")
 st.title("Agent Suite — Web UI")
 
 with st.sidebar:
-    st.header("Settings")
+    st.header("🧭 Navigation")
     charts_enabled = st.checkbox("Enable charts", value=CFG.enable_charts and have_matplotlib())
     transcribe_enabled = st.checkbox(
         "Enable transcription",
         value=CFG.enable_transcription and have_faster_whisper(),
         help="Requires faster-whisper",
     )
-    page = st.radio("Choose a tool", ["Insight", "Formatter", "AutoNote", "Planner", "Media"])
+    _choices = {
+        "🔎 Insight": "Insight",
+        "📝 Formatter": "Formatter",
+        "🗒️ AutoNote": "AutoNote",
+        "📋 Planner": "Planner",
+        "🖼️ Media": "Media",
+    }
+    sel = st.radio("Choose a tool", list(_choices.keys()))
+    page = _choices.get(sel, "Insight")
 
 
 def save_upload(upload, dest_dir: Path) -> Path:
@@ -60,8 +72,10 @@ def _recent_files(root: Path, patterns=("*.png", "*.md", "*.json", "*.pdf", "*.d
 
 
 def ui_insight():
-    st.header("InsightAgent")
-    colL, colR = st.columns([2, 1])
+    st.header("🔎 InsightAgent")
+    tab_inputs, tab_results, tab_logs = st.tabs(["Inputs", "Results", "Logs"])
+    with tab_inputs:
+        colL, _ = st.columns([2, 1])
 
     with colL:
         uploaded = st.file_uploader("Upload .txt/.log/.csv", type=["txt", "log", "csv"])
@@ -91,29 +105,90 @@ def ui_insight():
             target_path = dst
 
         if target_path is not None:
-            agent = InsightAgent(output_dir=OUT / "insight", templates_dir=TPL, charts=charts_enabled)
-            res = agent.summarize(target_path)
-            st.success("Analysis complete.")
-            st.subheader("Summary")
-            st.markdown(res.summary_md)
-            st.subheader("Artifacts")
-            for p in res.artifacts:
-                if p.suffix.lower() == ".png":
-                    st.image(str(p), caption=p.name)
-                else:
-                    st.write(str(p))
+            start_ts = datetime.now().timestamp()
+            cmd = [
+                sys.executable,
+                "-m",
+                "src.main",
+                "insight",
+                str(target_path),
+            ]
+            if not charts_enabled:
+                cmd.append("--no-charts")
+            st.info("Running: " + " ".join(cmd))
+            exp = st.expander("Live Logs", expanded=True)
+            log_area = exp.empty()
+            logs: list[str] = []
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(BASE),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True,
+                    bufsize=1,
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    logs.append(line.rstrip("\n"))
+                    # Keep last 400 lines to avoid huge UI
+                    if len(logs) > 400:
+                        logs = logs[-400:]
+                    log_area.code("\n".join(logs))
+                ret = proc.wait()
+            except Exception as e:
+                logs.append(f"[ui] Error: {e}")
+                log_area.code("\n".join(logs))
+                ret = -1
 
-            # Store result for Q&A
-            st.session_state["insight_summary"] = res.summary_md
-            st.session_state["insight_stats"] = getattr(res, "stats", {})
+            # Locate outputs for this run (best-effort by timestamp)
+            try:
+                run_root = OUT / "insight"
+                md_candidates = sorted(run_root.rglob("*_summary.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+                out_dir = None
+                for md in md_candidates:
+                    if md.stat().st_mtime >= start_ts - 2:
+                        out_dir = md.parent
+                        break
+                if out_dir is None and md_candidates:
+                    out_dir = md_candidates[0].parent
+                if out_dir is not None:
+                    st.session_state["insight_display_dir"] = str(out_dir)
+            except Exception:
+                pass
 
-            st.subheader("Ask about this insight")
-            q = st.text_input("Question", placeholder="e.g., How many rows? What are the top HTTP codes?")
-            if st.button("Ask") and q:
-                ans = _answer_insight(q, st.session_state.get("insight_summary", ""), st.session_state.get("insight_stats", {}))
-                st.markdown(ans if ans else "I couldn't find that in the summary.")
+            st.session_state["insight_last_run"] = {"path": str(target_path), "ts": datetime.now().isoformat(), "rc": ret}
+            st.toast("Insight job completed" if ret == 0 else "Insight job failed", icon="✅" if ret == 0 else "⚠️")
 
-    with colR:
+    with tab_results:
+        # Show latest run results if available
+        disp = st.session_state.get("insight_display_dir")
+        if disp:
+            out_dir = Path(disp)
+            if out_dir.exists():
+                st.subheader("Latest Run")
+                md_files = list(out_dir.glob("*_summary.md"))
+                if md_files:
+                    try:
+                        st.markdown(md_files[0].read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+                imgs = sorted(out_dir.glob("*.png"))
+                if imgs:
+                    st.caption("Charts")
+                    for img in imgs:
+                        st.image(str(img), caption=img.name)
+                # Offer ZIP download
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for p in out_dir.iterdir():
+                        if p.is_file():
+                            zf.write(p, arcname=p.name)
+                st.download_button(
+                    "Download outputs as ZIP",
+                    data=buf.getvalue(),
+                    file_name=f"insight_{out_dir.name}.zip",
+                )
         # Latest preview: show first chart and top lines of newest summary
         latest_summary = None
         summaries = list((OUT / "insight").rglob("*_summary.md"))
@@ -146,11 +221,15 @@ def ui_insight():
                 st.download_button("Download", data=p.read_bytes(), file_name=p.name, key="ins-" + str(p))
             except Exception:
                 st.write(str(p))
+    with tab_logs:
+        st.caption("Live logs will appear here in the next step.")
 
 
 def ui_formatter():
-    st.header("DocFormatterAgent")
-    colL, colR = st.columns([2, 1])
+    st.header("📝 DocFormatterAgent")
+    tab_inputs, tab_results, tab_logs = st.tabs(["Inputs", "Results", "Logs"])
+    with tab_inputs:
+        colL, _ = st.columns([2, 1])
 
     with colL:
         fmt = st.selectbox("Format", ["md", "docx", "pdf"], index=0)
@@ -174,6 +253,62 @@ def ui_formatter():
             temp = OUT / "uploads" / f"ui_{src_name}.md"
             temp.parent.mkdir(parents=True, exist_ok=True)
             temp.write_text(text_content, encoding="utf-8")
+            # Run via CLI and stream logs
+            start_ts = datetime.now().timestamp()
+            cmd = [
+                sys.executable,
+                "-m",
+                "src.main",
+                "docfmt",
+                str(temp),
+                "--format",
+                fmt,
+            ]
+            if branding:
+                cmd += ["--branding", branding]
+            st.info("Running: " + " ".join(cmd))
+            exp = st.expander("Live Logs", expanded=True)
+            log_area = exp.empty()
+            logs: list[str] = []
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(BASE),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True,
+                    bufsize=1,
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    logs.append(line.rstrip("\n"))
+                    if len(logs) > 400:
+                        logs = logs[-400:]
+                    log_area.code("\n".join(logs))
+                ret = proc.wait()
+            except Exception as e:
+                logs.append(f"[ui] Error: {e}")
+                log_area.code("\n".join(logs))
+                ret = -1
+            # Locate newest output file
+            try:
+                out_root = OUT / "docfmt"
+                files = [p for p in out_root.rglob("*") if p.is_file()]
+                files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                disp = None
+                for p in files:
+                    if p.stat().st_mtime >= start_ts - 2:
+                        disp = p
+                        break
+                if disp is None and files:
+                    disp = files[0]
+                if disp is not None:
+                    st.session_state["docfmt_display_path"] = str(disp)
+            except Exception:
+                pass
+            st.session_state["docfmt_last_run"] = {"src": str(temp), "ts": datetime.now().isoformat(), "rc": ret}
+            st.toast("DocFormatter job completed" if ret == 0 else "DocFormatter job failed", icon="✅" if ret == 0 else "⚠️")
+            return
             agent = DocFormatterAgent(templates_dir=TPL, output_dir=OUT / "docfmt")
             res = agent.format(temp, fmt=fmt, branding=branding or None)
             st.success(f"Generated {res.actual_format.upper()} → {Path(res.output_path).name}")
@@ -181,7 +316,25 @@ def ui_formatter():
                 st.markdown(Path(res.output_path).read_text(encoding="utf-8", errors="ignore"))
             st.download_button("Download", data=Path(res.output_path).read_bytes(), file_name=Path(res.output_path).name)
 
-    with colR:
+    with tab_results:
+        disp = st.session_state.get("docfmt_display_path")
+        if disp:
+            outp = Path(disp)
+            if outp.exists():
+                st.subheader("Latest Run")
+                if outp.suffix.lower() == ".md":
+                    try:
+                        st.markdown(outp.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+                try:
+                    st.download_button("Download output", data=outp.read_bytes(), file_name=outp.name)
+                except Exception:
+                    st.write(str(outp))
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    zf.write(outp, arcname=outp.name)
+                st.download_button("Download as ZIP", data=buf.getvalue(), file_name=f"docfmt_{outp.stem}.zip")
         st.subheader("Recent outputs")
         recent = _recent_files(OUT / "docfmt")
         if not recent:
@@ -192,31 +345,141 @@ def ui_formatter():
                 st.download_button("Download", data=p.read_bytes(), file_name=p.name, key="docfmt-" + str(p))
             except Exception:
                 st.write(str(p))
+    with tab_logs:
+        st.caption("Live logs will appear here in the next step.")
 
 
 def ui_autonote():
-    st.header("AutoNoteAgent")
+    st.header("🗒️ AutoNoteAgent")
     agent = AutoNoteAgent(memory_dir=MEM)
-    colL, colR = st.columns([2, 1])
+    tab_inputs, tab_results, tab_logs = st.tabs(["Inputs", "Results", "Logs"])
+    with tab_inputs:
+        colL, _ = st.columns([2, 1])
 
     with colL:
         msg = st.text_area("Message", height=120)
         topic = st.text_input("Topic", value=CFG.default_topic)
         c1, c2, c3 = st.columns(3)
         if c1.button("Add") and msg:
-            res = agent.add_message(msg, topic=topic or None)
-            st.success("Saved.")
-            st.write(str(res.summary_path))
+            start_ts = datetime.now().timestamp()
+            cmd = [
+                sys.executable,
+                "-m",
+                "src.main",
+                "autonote",
+                msg,
+            ]
+            if topic:
+                cmd += ["--topic", topic]
+            st.info("Running: " + " ".join(cmd))
+            exp = st.expander("Live Logs", expanded=True)
+            log_area = exp.empty()
+            logs: list[str] = []
+            try:
+                proc = subprocess.Popen(cmd, cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    logs.append(line.rstrip("\n"))
+                    if len(logs) > 400:
+                        logs = logs[-400:]
+                    log_area.code("\n".join(logs))
+                ret = proc.wait()
+            except Exception as e:
+                logs.append(f"[ui] Error: {e}")
+                log_area.code("\n".join(logs))
+                ret = -1
+            # Find today's summary
+            try:
+                summ_dir = MEM / "summaries"
+                files = [p for p in summ_dir.glob("*.md")]
+                files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                disp = None
+                for p in files:
+                    if p.stat().st_mtime >= start_ts - 2:
+                        disp = p
+                        break
+                if disp is None and files:
+                    disp = files[0]
+                if disp is not None:
+                    st.session_state["autonote_display_path"] = str(disp)
+            except Exception:
+                pass
+            st.toast("Note added" if ret == 0 else "Add failed", icon="✅" if ret == 0 else "⚠️")
         if c2.button("Resummarize Today"):
-            res = agent.resummarize()
-            st.success("Resummarized.")
-            st.write(str(res.summary_path))
+            start_ts = datetime.now().timestamp()
+            cmd = [sys.executable, "-m", "src.main", "autonote", "--resummarize"]
+            st.info("Running: " + " ".join(cmd))
+            exp = st.expander("Live Logs", expanded=True)
+            log_area = exp.empty()
+            logs: list[str] = []
+            try:
+                proc = subprocess.Popen(cmd, cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    logs.append(line.rstrip("\n"))
+                    if len(logs) > 400:
+                        logs = logs[-400:]
+                    log_area.code("\n".join(logs))
+                ret = proc.wait()
+            except Exception as e:
+                logs.append(f"[ui] Error: {e}")
+                log_area.code("\n".join(logs))
+                ret = -1
+            # Capture most recent summary
+            try:
+                summ_dir = MEM / "summaries"
+                files = [p for p in summ_dir.glob("*.md")]
+                files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                if files:
+                    st.session_state["autonote_display_path"] = str(files[0])
+            except Exception:
+                pass
+            st.toast("Resummarized" if ret == 0 else "Resummarize failed", icon="✅" if ret == 0 else "⚠️")
         if c3.button("Weekly Summary"):
-            p = agent.weekly_summary()
-            st.success("Weekly written.")
-            st.write(str(p))
+            start_ts = datetime.now().timestamp()
+            cmd = [sys.executable, "-m", "src.main", "autonote", "--weekly"]
+            st.info("Running: " + " ".join(cmd))
+            exp = st.expander("Live Logs", expanded=True)
+            log_area = exp.empty()
+            logs: list[str] = []
+            try:
+                proc = subprocess.Popen(cmd, cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    logs.append(line.rstrip("\n"))
+                    if len(logs) > 400:
+                        logs = logs[-400:]
+                    log_area.code("\n".join(logs))
+                ret = proc.wait()
+            except Exception as e:
+                logs.append(f"[ui] Error: {e}")
+                log_area.code("\n".join(logs))
+                ret = -1
+            # Show latest weekly summary written
+            try:
+                summ_dir = MEM / "summaries"
+                files = [p for p in summ_dir.glob("*.md")]
+                files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                if files:
+                    st.session_state["autonote_display_path"] = str(files[0])
+            except Exception:
+                pass
+            st.toast("Weekly summary done" if ret == 0 else "Weekly failed", icon="✅" if ret == 0 else "⚠️")
 
-    with colR:
+    with tab_results:
+        disp = st.session_state.get("autonote_display_path")
+        if disp:
+            p = Path(disp)
+            if p.exists():
+                st.subheader("Latest Run")
+                try:
+                    st.markdown(p.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    pass
+                try:
+                    st.download_button("Download summary", data=p.read_bytes(), file_name=p.name)
+                except Exception:
+                    st.write(str(p))
         st.subheader("Recent summaries")
         summ_dir = MEM / "summaries"
         files = []
@@ -242,23 +505,114 @@ def ui_autonote():
                 st.download_button("Download", data=p.read_bytes(), file_name=p.name, key="note-" + str(p))
             except Exception:
                 st.write(str(p))
+    with tab_logs:
+        st.caption("Live logs will appear here in the next step.")
 
 
 def ui_planner():
-    st.header("TaskPlannerAgent")
+    st.header("📋 TaskPlannerAgent")
     agent = TaskPlannerAgent(store_path=OUT / "tasks.json")
-    colL, colR = st.columns([2, 1])
+    tab_inputs, tab_results, tab_logs = st.tabs(["Inputs", "Results", "Logs"])
+    with tab_inputs:
+        colL, _ = st.columns([2, 1])
 
-    with colL:
-        goal = st.text_input("Goal")
-        if st.button("Create tasks") and goal:
-            tasks = agent.create_from_goal(goal, append=True)
-            st.success(f"Added {len(tasks)} tasks.")
-        tasks = agent.list_tasks(status="all")
-        if tasks:
-            st.dataframe([t.__dict__ for t in tasks], use_container_width=True)
+        with colL:
+            goal = st.text_input("Goal")
+            c_create, c_list, c_done = st.columns([1, 1, 1])
+            status = c_list.selectbox("List status", ["all", "todo", "done"], index=0)
+            done_id = c_done.number_input("Done ID", min_value=1, step=1)
 
-    with colR:
+            if c_create.button("Create tasks") and goal:
+                start_ts = datetime.now().timestamp()
+                cmd = [sys.executable, "-m", "src.main", "plan", "create", goal]
+                st.info("Running: " + " ".join(cmd))
+                exp = st.expander("Live Logs", expanded=True)
+                log_area = exp.empty()
+                logs: list[str] = []
+                try:
+                    proc = subprocess.Popen(cmd, cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        logs.append(line.rstrip("\n"))
+                        if len(logs) > 400:
+                            logs = logs[-400:]
+                        log_area.code("\n".join(logs))
+                    ret = proc.wait()
+                except Exception as e:
+                    logs.append(f"[ui] Error: {e}")
+                    log_area.code("\n".join(logs))
+                    ret = -1
+                # Load tasks.json
+                try:
+                    tdb = OUT / "tasks.json"
+                    if tdb.exists():
+                        st.session_state["planner_tasks_json"] = json.loads(tdb.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    pass
+                st.toast("Tasks created" if ret == 0 else "Create failed", icon="✅" if ret == 0 else "⚠️")
+
+            if c_list.button("List"):
+                cmd = [sys.executable, "-m", "src.main", "plan", "list", "--status", status]
+                st.info("Running: " + " ".join(cmd))
+                exp = st.expander("Live Logs", expanded=True)
+                log_area = exp.empty()
+                logs: list[str] = []
+                try:
+                    proc = subprocess.Popen(cmd, cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        logs.append(line.rstrip("\n"))
+                        if len(logs) > 400:
+                            logs = logs[-400:]
+                        log_area.code("\n".join(logs))
+                    ret = proc.wait()
+                except Exception as e:
+                    logs.append(f"[ui] Error: {e}")
+                    log_area.code("\n".join(logs))
+                    ret = -1
+                try:
+                    tdb = OUT / "tasks.json"
+                    if tdb.exists():
+                        st.session_state["planner_tasks_json"] = json.loads(tdb.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    pass
+
+            if c_done.button("Mark Done"):
+                cmd = [sys.executable, "-m", "src.main", "plan", "done", "--id", str(int(done_id))]
+                st.info("Running: " + " ".join(cmd))
+                exp = st.expander("Live Logs", expanded=True)
+                log_area = exp.empty()
+                logs: list[str] = []
+                try:
+                    proc = subprocess.Popen(cmd, cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        logs.append(line.rstrip("\n"))
+                        if len(logs) > 400:
+                            logs = logs[-400:]
+                        log_area.code("\n".join(logs))
+                    ret = proc.wait()
+                except Exception as e:
+                    logs.append(f"[ui] Error: {e}")
+                    log_area.code("\n".join(logs))
+                    ret = -1
+                try:
+                    tdb = OUT / "tasks.json"
+                    if tdb.exists():
+                        st.session_state["planner_tasks_json"] = json.loads(tdb.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    pass
+                st.toast("Task marked done" if ret == 0 else "Done failed", icon="✅" if ret == 0 else "⚠️")
+
+    with tab_results:
+        # Latest tasks view
+        tbl = st.session_state.get("planner_tasks_json")
+        if isinstance(tbl, list) and tbl:
+            try:
+                st.subheader("Latest Tasks")
+                st.dataframe(tbl, use_container_width=True)
+            except Exception:
+                pass
         st.subheader("Tasks DB")
         tdb = OUT / "tasks.json"
         if tdb.exists():
@@ -287,11 +641,15 @@ def ui_planner():
                 pass
         else:
             st.caption("No tasks created yet.")
+    with tab_logs:
+        st.caption("Live logs will appear here in the next step.")
 
 
 def ui_media():
-    st.header("MediaAnalyzerAgent")
-    colL, colR = st.columns([2, 1])
+    st.header("🖼️ MediaAnalyzerAgent")
+    tab_inputs, tab_results, tab_logs = st.tabs(["Inputs", "Results", "Logs"])
+    with tab_inputs:
+        colL, _ = st.columns([2, 1])
 
     with colL:
         up = st.file_uploader(
@@ -322,19 +680,79 @@ def ui_media():
             target_path = dst
 
         if target_path is not None:
-            agent = MediaAnalyzerAgent(output_dir=OUT / "media", transcription=transcribe_enabled)
-            res = agent.analyze(target_path)
-            st.success("Analysis complete.")
-            st.subheader("JSON Report")
-            st.code(Path(res.json_path).read_text(encoding="utf-8", errors="ignore"), language="json")
-            if res.extra_path and res.extra_path.suffix.lower() == ".png":
-                st.subheader("Histogram")
-                st.image(str(res.extra_path))
-            if res.extra_path and res.extra_path.suffix.lower() == ".txt":
-                st.subheader("Transcript")
-                st.text(Path(res.extra_path).read_text(encoding="utf-8", errors="ignore"))
+            start_ts = datetime.now().timestamp()
+            cmd = [sys.executable, "-m", "src.main", "media", str(target_path)]
+            st.info("Running: " + " ".join(cmd))
+            exp = st.expander("Live Logs", expanded=True)
+            log_area = exp.empty()
+            logs: list[str] = []
+            try:
+                proc = subprocess.Popen(cmd, cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    logs.append(line.rstrip("\n"))
+                    if len(logs) > 400:
+                        logs = logs[-400:]
+                    log_area.code("\n".join(logs))
+                ret = proc.wait()
+            except Exception as e:
+                logs.append(f"[ui] Error: {e}")
+                log_area.code("\n".join(logs))
+                ret = -1
+            # Find outputs
+            try:
+                out_root = OUT / "media"
+                jsons = [p for p in out_root.rglob("*.json")]
+                jsons.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                disp_json = None
+                for p in jsons:
+                    if p.stat().st_mtime >= start_ts - 2:
+                        disp_json = p
+                        break
+                if disp_json is None and jsons:
+                    disp_json = jsons[0]
+                extra = None
+                if disp_json:
+                    cand_png = disp_json.with_suffix(".png")
+                    cand_txt = disp_json.with_suffix(".txt")
+                    if cand_png.exists():
+                        extra = cand_png
+                    elif cand_txt.exists():
+                        extra = cand_txt
+                if disp_json is not None:
+                    st.session_state["media_display_json"] = str(disp_json)
+                    st.session_state["media_display_extra"] = str(extra) if extra else None
+            except Exception:
+                pass
+            st.toast("Media analysis complete" if ret == 0 else "Media failed", icon="✅" if ret == 0 else "⚠️")
+            return
 
-    with colR:
+    with tab_results:
+        dj = st.session_state.get("media_display_json")
+        if dj:
+            p = Path(dj)
+            if p.exists():
+                st.subheader("Latest Run")
+                try:
+                    st.json(json.loads(p.read_text(encoding="utf-8", errors="ignore")))
+                except Exception:
+                    st.code(p.read_text(encoding="utf-8", errors="ignore"), language="json")
+                extra = st.session_state.get("media_display_extra")
+                if extra:
+                    ep = Path(extra)
+                    if ep.suffix.lower() == ".png" and ep.exists():
+                        st.caption("Histogram")
+                        st.image(str(ep))
+                    elif ep.suffix.lower() == ".txt" and ep.exists():
+                        st.caption("Transcript")
+                        st.text(ep.read_text(encoding="utf-8", errors="ignore"))
+                # ZIP download
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    zf.write(p, arcname=p.name)
+                    if extra and Path(extra).exists():
+                        zf.write(Path(extra), arcname=Path(extra).name)
+                st.download_button("Download outputs as ZIP", data=buf.getvalue(), file_name=f"media_{p.stem}.zip")
         st.subheader("Recent outputs")
         recent = _recent_files(OUT / "media")
         if not recent:
@@ -345,6 +763,8 @@ def ui_media():
                 st.download_button("Download", data=p.read_bytes(), file_name=p.name, key="med-" + str(p))
             except Exception:
                 st.write(str(p))
+    with tab_logs:
+        st.caption("Live logs will appear here in the next step.")
 
 
 if page == "Insight":
